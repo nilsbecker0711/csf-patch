@@ -1,4 +1,4 @@
-# csf-patch
+# csf-patch (Master Thesis)
 
 Adversarial patches for semantic segmentation under a human contrast
 sensitivity (CSF) constraint, on Cityscapes.
