@@ -1,0 +1,107 @@
+#!/usr/bin/env python
+"""Block 0.1 — clean DATASET mIoU per architecture and resolution."""
+from __future__ import annotations
+
+import argparse
+import json
+from pathlib import Path
+
+import torch
+from torch.utils.data import DataLoader, Subset
+
+from _common import add_model_args, setup_model
+from _common import make_dataset, image_indices
+from patchreach.data.cityscapes import CityscapesSeg, class_name, upsample_to
+from patchreach.metrics.miou import SegMetric
+from patchreach.utils import get_device, seed_everything
+
+SLIDE_WARNING = """[eval] A SLIDE NUMBER IS NOT THE CLEAN REFERENCE FOR AN ATTACK RUN.
+       Under slide each window is an independent forward, so a patch cannot
+       influence pixels outside the windows containing it. At 1024x2048 with a
+       centred 128px patch that caps reach at 448/704px L/R for setr_pup, while
+       segformer and deeplab reach 960 — an ARCHITECTURE-DEPENDENT ceiling on
+       the quantity aggregate.py bins out to 1200px. Every attack path uses
+       whole-image forward. Compare this number to the published zoo value and
+       to nothing else."""
+
+
+def main():
+    p = add_model_args(argparse.ArgumentParser())
+    p.add_argument("--n_images", type=int, default=20,
+                   help="evaluate the first N val images (ignored if --images)")
+    p.add_argument("--images", default=None,
+                   help="specific val indices instead of the first --n_images: "
+                        "'420' | '2 45 420' | 'fixed10' | 'all'. Same indices "
+                        "as overfit.py --image, so a single-image clean "
+                        "number here matches that run's [clean] line.")
+    p.add_argument("--out", default=f"results/clean_baselines")
+    p.add_argument("--tag", type=str, default=None)
+    a = p.parse_args()
+    _stem = a.out[:-5] if a.out.endswith(".json") else a.out
+    a.out = f"{_stem}_{a.tag}.json" if a.tag else f"{_stem}.json"
+    seed_everything(a.seed)
+    device = get_device()
+    model, n_ch, n_act, spec = setup_model(a)
+
+    mode = getattr(model, "mode", "whole")
+    if mode == "slide":
+        print(SLIDE_WARNING)
+
+    ds = make_dataset(a, "val")
+    idxs = (image_indices(a.images, len(ds)) if a.images is not None
+            else list(range(min(a.n_images, len(ds)))))
+    loader = DataLoader(Subset(ds, idxs), batch_size=1, num_workers=2)
+
+    m = SegMetric(a.num_classes, device=device)
+    per_image = []
+    with torch.no_grad():
+        for i, (img, lbl) in enumerate(loader):
+            img, lbl = img.to(device), lbl.to(device)
+            pred = upsample_to(model(img), lbl.shape[-2:]).argmax(1)
+            m.update(pred, lbl)
+            one = SegMetric(a.num_classes, device=device)
+            one.update(pred, lbl)
+            per_image.append(one.compute())
+
+    iou = m.per_class()
+    dataset_miou = m.compute()
+
+    print(f"\n{'='*66}")
+    print(f" {a.arch} @ {a.img_h}x{a.img_w} ({mode}) over "
+          f"{len(per_image)} val images")
+    print(f"{'='*66}")
+    print(f"  DATASET mIoU  : {dataset_miou:.2f}   <- compare to published")
+    pim = torch.tensor(per_image)
+    std = float(pim.std()) if len(pim) > 1 else 0.0
+    print(f"  per-image mIoU: {pim.mean():.2f} +/- {std:.2f} "
+          f"(range {pim.min():.2f}-{pim.max():.2f})")
+    print(f"                  NOT comparable to published numbers")
+    if a.images is not None and len(idxs) <= 20:
+        print("\n  per-image mIoU (gt classes, = overfit.py's [clean] all):")
+        for i, v in zip(idxs, per_image):
+            print(f"    img {i:4d}: {v:6.2f}")
+    print("\n  per-class IoU:")
+    for c in range(min(a.num_classes, 19)):
+        if not torch.isnan(iou[c]):
+            print(f"    {c:2d} {class_name(c):10s}: {iou[c]:6.2f}")
+
+    rec = {"arch": a.arch, "img_h": a.img_h, "img_w": a.img_w,
+           "inference": mode, "scale": getattr(a, "scale", "resize"),
+           "n_images": len(per_image), "dataset_miou": dataset_miou,
+           "images": idxs,
+           "per_image_miou": dict(zip(map(str, idxs), map(float, per_image))),
+           "per_image_mean": float(pim.mean()), "per_image_std": std,
+           "backbone_channels": n_ch, "backbone_active": n_act,
+           "per_class_iou": {class_name(c): (None if torch.isnan(iou[c])
+                                             else float(iou[c]))
+                             for c in range(min(a.num_classes, 19))}}
+    out = Path(a.out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    all_rec = json.loads(out.read_text()) if out.exists() else []
+    all_rec.append(rec)
+    out.write_text(json.dumps(all_rec, indent=2))
+    print(f"\n  appended -> {out}")
+
+
+if __name__ == "__main__":
+    main()

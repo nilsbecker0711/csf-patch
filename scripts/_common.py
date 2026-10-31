@@ -1,0 +1,500 @@
+"""Shared CLI plumbing."""
+from __future__ import annotations
+
+import argparse
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+import torch
+
+from patchreach.data.cityscapes import CityscapesSeg, norm_tensors
+from patchreach.models.registry import REGISTRY, resolve, load_segmentor
+from patchreach.models.wrapper import (SlidingWindowSegModel, WrappedSegModel,
+                                       low_precision_dtype)
+from patchreach.utils import get_device, seed_everything, channel_probe
+
+FIXED10 = [430, 46, 441, 331, 45, 162, 195, 424, 91, 353]
+
+
+def add_model_args(p):
+    p.add_argument("--arch", default="internimage_t",
+                   help=f"one of {sorted(REGISTRY)}")
+    p.add_argument("--cfg_path", default=None,
+                   help="mmseg config (.py). Overrides the registry entry. "
+                        "Must MATCH the checkpoint variant — a b0 config will "
+                        "not build b5.")
+    p.add_argument("--weights", default=None, help="checkpoint (.pth)")
+    p.add_argument("--cityscapes_root", default=None,
+                   help="Cityscapes root. Required, but may come from --config\n"
+                        "where a script supports one — validated in setup_model().")
+    p.add_argument("--img_h", type=int, default=512)
+    p.add_argument("--img_w", type=int, default=1024)
+    p.add_argument("--scale", choices=["resize", "crop"], default="resize",
+                   help="resize (default): squeeze the whole 2048x1024 frame "
+                        "into img_h x img_w — tensor shape matches the mmseg "
+                        "training crop, pixel density does not. crop: cut that "
+                        "window out of the NATIVE frame, so density is what "
+                        "every published number is measured at. See "
+                        "CityscapesSeg.")
+    p.add_argument("--inference", choices=["whole", "slide", "auto"],
+                   default="whole",
+                   help="whole (default): one forward, what every attack and "
+                        "reach measurement uses. auto: honour the checkpoint's "
+                        "test_cfg — slide for segformer/setr, whole for "
+                        "deeplab/unet — to reproduce published numbers. slide: "
+                        "force it. NOTE slide makes each window an independent "
+                        "forward, capping patch reach per architecture; do not "
+                        "use it for cross-architecture comparisons.")
+    p.add_argument("--slide_checkpoint", action="store_true",
+                   help="--inference slide only: recompute each window during "
+                        "backward instead of holding every window's graph. "
+                        "One window's activations instead of n_windows', at "
+                        "the cost of a second forward. Use when the attack "
+                        "OOMs at native resolution.")
+    p.add_argument("--low_pr", action="store_true",
+                   help="run the segmentor forward in 16 bit (autocast): bf16 "
+                        "on Ampere+, else fp16 with internal gradient scaling. "
+                        "Roughly halves activation memory; stacks with "
+                        "--slide_checkpoint. Logits shift slightly, so compare "
+                        "only against a clean baseline run with the same flag. "
+                        "Unset: fp32, unchanged.")
+    p.add_argument("--num_classes", type=int, default=19)
+    p.add_argument("--seed", type=int, default=42)
+    return p
+
+
+def add_patch_args(p):
+    p.add_argument("--patch_mode", default="raw",
+                   choices=["raw", "gan", "raw_ganinit", "lap", "csf",
+                            "universal_csf"],
+                   help="csf: base + a residual whose spectrum is bounded by "
+                        "the human contrast sensitivity function. Pair with "
+                        "--from_image in overfit.py so the base is the region "
+                        "the patch covers; otherwise the base is grey and the "
+                        "patch is a visible square with an invisible texture. "
+                        "universal_csf: ONE residual shared across the whole "
+                        "dataset, added onto whatever content it lands on — "
+                        "the non-adaptive control for csf. train.py only; it "
+                        "is meaningless on a single image, where it IS csf.")
+    p.add_argument("--patch_size", type=int, default=128)
+    p.add_argument("--patch_scale", type=float, default=0.25)
+    p.add_argument("--patch_scale_ref", choices=["height", "area"],
+                   default="height",
+                   help="what --patch_scale is a fraction of. height "
+                        "(default, every run to date): side = scale*H, so "
+                        "aspect ratio decides frame coverage — 0.25 covers "
+                        "3.1%% of 512x1024 but 6.25%% of 1024x1024. area: "
+                        "side = scale*sqrt(H*W), so the patch covers scale**2 "
+                        "of the frame at ANY input shape (6.25%% at 0.25). "
+                        "Use area when inputs differ in shape. Neither holds "
+                        "the PHYSICAL size constant when the field of view "
+                        "changes — see placement.footprint_side.")
+    p.add_argument("--logit_clip", type=float, default=6.0,
+                   help="bound on |param| for pixel modes. Stops the\n"
+                        "sigmoid saturating into a dead-gradient state. 0 disables.")
+    p.add_argument("--pixel_param", default="sigmoid",
+                   choices=["sigmoid", "direct"],
+                   help="raw mode only. 'sigmoid' (default) is every "
+                        "run to date: pixel = sigmoid(param), a "
+                        "bounded map with no gradient ever killed by "
+                        "a bound. 'direct' makes the parameter the "
+                        "pixel and projects it back into [0,1] after "
+                        "each step, which is what PGD does. Pair with "
+                        "--optimiser sign for the full PGD recipe.")
+    p.add_argument("--raw_init", default="grey",
+                   choices=["grey", "random"],
+                   help="pixel modes (raw/lap-less) only. 'grey' (default) is "
+                        "uniform 0.5 and every run to date. 'random' draws "
+                        "each pixel uniformly from [0,1]: the RANDOM PATCH "
+                        "baseline. Since mIoU here is scored OUTSIDE the "
+                        "footprint, the clean number is not the right "
+                        "comparison for an attack — an arbitrary patch of the "
+                        "same size at the same position is, and that is the "
+                        "column Nesti et al. (WACV 2022) report. Combine with "
+                        "--lr 0 to get it without training. csf and "
+                        "universal_csf ignore this: they already initialise "
+                        "from randn projected onto the CSF envelope, so their "
+                        "--lr 0 run is a random patch at exactly tau.")
+    p.add_argument("--shape", default="square",
+                   choices=["square", "alpha", "chroma", "auto"],
+                   help="silhouette source — the Bg() term of Tan et al. Eq 5. "
+                        "'alpha' needs an RGBA reference; 'auto' keys the "
+                        "background from the corner medians.")
+    p.add_argument("--reference_fit", default="auto",
+                   choices=["auto", "crop", "pad", "stretch"],
+                   help="how to square a non-square reference. "
+                        "auto: crop to the alpha bbox then pad "
+                        "(maximises object coverage), else "
+                        "centre-crop. stretch DISTORTS geometry.")
+    p.add_argument("--shape_bg", default="white", choices=["white", "black"],
+                   help="background colour to key out for --shape chroma")
+    p.add_argument("--shape_thresh", type=float, default=0.15,
+                   help="chroma keying distance threshold")
+    p.add_argument("--placement", default="center",
+                   choices=["center", "fixed", "semantic", "gradcam"],
+                   help="where the patch goes. 'gradcam' is the argmax over "
+                        "MeanPool(M_i) — the per-image sensitivity hotspot, "
+                        "the SAME policy --gen_placement gradcam uses on the "
+                        "conditional generator. It is only coherent for "
+                        "PER-IMAGE attacks (overfit.py, overfit_population.py): "
+                        "a universal patch is shared across images while the "
+                        "map is not, so train.py would be placing one tensor "
+                        "by a different image's sensitivity every batch.")
+    p.add_argument("--placement_class", type=int, default=0,
+                   help="trainId for --placement semantic. 0=road is "
+                        "omnipresent in Cityscapes; 1=sidewalk is absent from "
+                        "many frames and would silently fall back to centre.")
+    p.add_argument("--placement_xy", type=float, nargs=2, default=[0.5, 0.5],
+                   help="normalised (y, x) CENTRE for --placement fixed. "
+                        "(0.75, 0.5) is the road surface straight ahead.")
+    p.add_argument("--placement_margin", type=int, default=0,
+                   help="keep a --placement gradcam window this many px from "
+                        "every image border. DEFAULT 0 reproduces the "
+                        "unmargined argmax and leaves center/fixed/semantic "
+                        "untouched. The sensitivity map's hottest ridge is the "
+                        "near-field road boundary along the bottom of a "
+                        "dashcam frame, so the argmax tends to pin the patch "
+                        "flush against the edge, where ~half its receptive "
+                        "field lies outside the image and can never be "
+                        "influenced. Try p/2 (64 at the default geometry).")
+    p.add_argument("--reference", default=None)
+    p.add_argument("--lap_alpha", type=float, default=0.0)
+    p.add_argument("--lap_beta", type=float, default=0.0)
+    p.add_argument("--lap_gamma", type=float, default=0.0)
+    p.add_argument("--lap_freeze_edges", action="store_true",
+                   help="hard-pin the reference's strong edges (Grad term of "
+                        "Eq 5) so the outline survives optimisation")
+    p.add_argument("--lap_edge_thresh", type=float, default=0.1,
+                   help="theta for the edge mask. Tan et al. use 0.1, tuned "
+                        "for FLAT CARTOONS. Photographs have far denser "
+                        "gradients — at 0.1 roughly half a photo reference "
+                        "gets frozen — so 0.15-0.25 is usually right. Check "
+                        "with score_reference.py --sweep_edge; aim for "
+                        "free/sil of 0.5-0.7.")
+    p.add_argument("--init_from", default=None)
+    add_cam_args(p)
+    add_csf_args(p)
+    add_tsallis_args(p)
+    return p
+
+
+def add_tsallis_args(p):
+    """Tsallis attack objective (--loss_fn tsallis)."""
+    if any(a.option_strings and "--tsallis_q" in a.option_strings
+           for a in p._actions):
+        return p
+    g = p.add_argument_group("Tsallis attack objective (--loss_fn tsallis)")
+    g.add_argument("--tsallis_q", type=float, default=0.0,
+                   help="q for --tsallis_schedule const. q -> 1 IS plain CE; "
+                        "q <= 1 is required. The gradient weight is p^(1-q), "
+                        "peaking at p* = (1-q)/(2-q), so q=0 targets pixels "
+                        "at p_y~0.5 and q=-3 targets p_y~0.8 — i.e. more "
+                        "negative aims the attack at CONFIDENT pixels. "
+                        "IGNORED when the schedule is linear.")
+    g.add_argument("--tsallis_schedule", default="const",
+                   choices=["const", "linear"],
+                   help="const: q fixed at --tsallis_q. linear: q sweeps "
+                        "--tsallis_q_start -> --tsallis_q_end across the run, "
+                        "t = step/(total_steps-1). DEFAULT const, so the "
+                        "paper's validation-selected -2 -> 1 sweep is an "
+                        "explicit choice rather than an inherited one.")
+    g.add_argument("--tsallis_q_start", type=float, default=-2.0,
+                   help="q at t=0 for --tsallis_schedule linear. IGNORED "
+                        "under const.")
+    g.add_argument("--tsallis_q_end", type=float, default=1.0,
+                   help="q at t=1 for --tsallis_schedule linear. 1.0 lands on "
+                        "the CE limit, which is the paper's setting. IGNORED "
+                        "under const.")
+    return p
+
+
+def tsallis_tag(a) -> str:
+    """Run-directory slug for the active q, or '' for every other loss_fn."""
+    if getattr(a, "loss_fn", None) != "tsallis":
+        return ""
+    if getattr(a, "tsallis_schedule", "const") == "const":
+        return f"q{getattr(a, 'tsallis_q', 0.0):g}"
+    return (f"q{getattr(a, 'tsallis_q_start', -2.0):g}"
+            f"to{getattr(a, 'tsallis_q_end', 1.0):g}")
+
+
+def tsallis_kwargs(src, total_steps: int = 1) -> dict:
+    """argparse namespace (or a saved config dict) -> the tsallis_* keywords adversarial.build() and segmentation_cam.build() take."""
+    get = (src.get if isinstance(src, dict)
+           else lambda k, d: getattr(src, k, d))
+    return {"tsallis_q": get("tsallis_q", 0.0),
+            "tsallis_schedule": get("tsallis_schedule", "const"),
+            "tsallis_q_start": get("tsallis_q_start", -2.0),
+            "tsallis_q_end": get("tsallis_q_end", 1.0),
+            "tsallis_total_steps": total_steps}
+
+
+def add_cam_args(p):
+    """Sensitivity-map arguments — shared by add_patch_args and add_generator_args, one definition."""
+    if any(a.option_strings and "--cam_objective" in a.option_strings
+           for a in p._actions):
+        return p
+    g = p.add_argument_group("sensitivity map (Grad-CAM)")
+    g.add_argument("--cam_objective", default="attack",
+                   choices=["attack", "ce", "cospgd", "ipatch_cospgd",
+                            "tsallis"],
+                   help="ABLATION F. Scalar S_seg differentiated for the CAM. "
+                        "'attack' reuses --loss_fn so the map and the attack "
+                        "share one objective. S_seg = -L, because every loss "
+                        "in adversarial.py is MINIMISED to attack while "
+                        "Grad-CAM needs a score to increase.")
+    g.add_argument("--cam_target", default="pred", choices=["pred", "gt"],
+                   help="labels for S_seg. 'pred' uses the model's own argmax, "
+                        "keeping the LABEL-FREE threat model that --placement "
+                        "semantic already assumes. 'gt' is a strictly stronger "
+                        "attacker and must be declared as such.")
+    g.add_argument("--cam_layer", type=int, default=-1,
+                   help="which feature map from the hooked module. -1 = "
+                        "deepest/coarsest, the standard Grad-CAM choice.")
+    g.add_argument("--cam_module", default="backbone",
+                   help="dotted path inside the mmseg segmentor to hook")
+    return p
+
+
+def add_csf_args(p):
+    """Shared by add_patch_args and add_generator_args — one definition."""
+    if any(a.option_strings and "--csf_threshold" in a.option_strings
+           for a in p._actions):
+        return p
+    g = p.add_argument_group("perceptual constraint (csf)")
+    g.add_argument("--csf_threshold", type=float, default=0.25)
+    g.add_argument("--csf_model", default="barten", choices=["barten", "sso"])
+    g.add_argument("--csf_beta", type=float, default=3.0)
+    g.add_argument("--csf_min_cycles", type=float, default=2.0)
+    g.add_argument("--csf_pixel_size_cm", type=float, default=0.0114)
+    g.add_argument("--csf_viewing_distance_cm", type=float, default=50.0)
+    g.add_argument("--csf_display_peak_cd_m2", type=float, default=100.0,
+                   help="display peak white, for the luminance-aware path "
+                        "only. Sets the absolute luminance Barten's pupil "
+                        "formula needs; 100 is the sRGB reference white.")
+    g.add_argument("--csf_lref", type=float, default=0.0,
+                   help="reference LINEAR luminance Y for the CSF budget. "
+                        "DEFAULT 0 keeps the legacy mu=0.5 convention, so a "
+                        "tau here means what it means in every run recorded so "
+                        "far. >0 switches to the calibrated budget, which is "
+                        "~1.9x tighter at Nyquist — measured, not estimated. "
+                        "0.097 is the Cityscapes train median at centre.")
+    g.add_argument("--csf_max_cpp", type=float, default=0.0,
+                   help="HIGH CUT on the budget, in cycles/pixel. 0 (default) "
+                        "= off, i.e. every run to date. The 1/CSF envelope "
+                        "puts 91.7%% of its power above 0.5 c/px and 99.6%% "
+                        "above 0.35 -- the diagonal corner, a 1-2px "
+                        "checkerboard, of which a 2x2 box average passes "
+                        "0.75%%. The cut is applied BEFORE the tau "
+                        "normalisation, so the surviving bins absorb the "
+                        "allowance: same nominal tau, same per-bin JND, ~11x "
+                        "less total RMS, more RMS in the bands the stem can "
+                        "propagate. 0.35 is the band the probe measured.")
+    g.add_argument("--csf_param", default="pgd", choices=["pgd", "squash"],
+                   help="mode=csf only. How the parameter becomes a residual. "
+                        "pgd: the parameter IS the residual and every rfft bin "
+                        "is clamped to its budget after each step (phase free), "
+                        "as universal_csf has always done. squash: the original "
+                        "B(f)*Z/sqrt(1+|Z|^2) reparameterisation plus a rescale "
+                        "to exactly tau — it saturates, freezing bin magnitudes "
+                        "and leaving the optimiser only phase to rotate. Kept "
+                        "so pre-existing csf runs stay reproducible. Note the "
+                        "taus are NOT interchangeable: squash enforces tau as "
+                        "an equality, pgd as v <= tau. Compare at matched "
+                        "realised visibility.")
+    g.add_argument("--csf_enforce", default="nominal",
+                   choices=["nominal", "realised"],
+                   help="what tau bounds. nominal: the residual we INTEND to "
+                        "add (every run to date). realised: the residual that "
+                        "SURVIVES compositing, i.e. what an observer sees -- "
+                        "clipping against real content was measured inflating "
+                        "it to 2.8x tau at 1000 steps. Use realised for any "
+                        "number quoted with a tau attached.")
+    g.add_argument("--csf_composite", default="clip", choices=["clip", "fit"],
+                   help="universal_csf only. clip: x+delta clamped to [0,1], "
+                        "and frac_clipped reports where that bit. fit: "
+                        "fit_to_range rescales instead, preserving the "
+                        "spectrum but introducing a PER-IMAGE scale — which is "
+                        "an adaptation a universal patch should not have. "
+                        "clip is the honest default; fit is the control.")
+    return p
+
+
+def add_generator_args(p):
+    """Image-conditioned generator (--mode conditional_generator)."""
+    g = p.add_argument_group("conditional generator")
+
+    g.add_argument("--patch_size", type=int, default=128,
+                   help="S — the generator's output resolution")
+    g.add_argument("--patch_scale", type=float, default=0.25,
+                   help="patch side as a fraction of image HEIGHT; "
+                        "p = int(H*scale), the same rule Patch.apply() uses")
+
+    g.add_argument("--gen_base_ch", type=int, default=32)
+    g.add_argument("--gen_depth", type=int, default=3,
+                   help="U-Net downsampling levels; patch_size must be "
+                        "divisible by 2**depth")
+    g.add_argument("--gen_cond", default="image+ref+cam",
+                   choices=["image", "image+ref", "image+ref+cam"],
+                   help="ABLATION E. What G_theta is conditioned on. The "
+                        "residual base stays r_i in every setting, so this "
+                        "isolates conditioning from parameterisation.")
+    g.add_argument("--gen_residual", default="logit",
+                   choices=["logit", "clip", "none", "csf"],
+                   help="logit: p=sigmoid(logit_seed(r)+D) — matches spec.py's "
+                        "sigmoid parameterisation, no dead gradients at 0/1. "
+                        "clip: p=clamp(r+tanh(D),0,1). none: p=sigmoid(D), "
+                        "ignoring r as a base.")
+    g.add_argument("--gen_residual_scale", type=float, default=1.0)
+    g.add_argument("--gen_noise_dim", type=int, default=0,
+                   help="z_i channels. 0 = deterministic generation (default). "
+                        "Evaluation always uses the prior mean (zeros) so the "
+                        "reported test-time patch is reproducible.")
+
+    add_csf_args(p)
+
+    add_cam_args(p)
+
+    add_tsallis_args(p)
+
+    g.add_argument("--gen_placement", default="gradcam",
+                   choices=["center", "gradcam", "semantic", "fixed"],
+                   help="ABLATION A vs B. gradcam = argmax over MeanPool(M_i). "
+                        "This flag is READ ONLY by the conditional-generator "
+                        "scripts; --placement for the existing patch modes is "
+                        "untouched.")
+    g.add_argument("--gen_placement_class", type=int, default=0)
+    g.add_argument("--gen_placement_xy", type=float, nargs=2,
+                   default=[0.5, 0.5])
+    g.add_argument("--gen_placement_margin", type=int, default=0,
+                   help="keep the gradcam window this many px from every image "
+                        "border. DEFAULT 0 reproduces the unmargined argmax. "
+                        "The sensitivity map's hottest ridge is the near-field "
+                        "road boundary along the bottom of a dashcam frame, so "
+                        "the argmax tends to pin the patch flush against the "
+                        "edge, where ~half its receptive field lies outside "
+                        "the image. Try p/2 (64 at the default geometry).")
+
+    g.add_argument("--gen_reference", default="center",
+                   choices=["center", "window"],
+                   help="where r_i is sampled. 'center' is the centre crop. "
+                        "'window' samples the content the patch REPLACES, "
+                        "removing the perspective mismatch between a "
+                        "mid-distance reference and a near-field destination. "
+                        "With 'window' baseline A becomes a literal no-op, so "
+                        "every point of degradation is the generator's.")
+
+    g.add_argument("--gen_lap_alpha", type=float, default=0.0,
+                   help="ABLATION C vs D. L_rat weight. DEFAULT 0: L_rat and "
+                        "L_tv are SUMS (1e2-1e4) while the attack losses are "
+                        "per-pixel MEANS (1e-2 to 20). Read the step-1 "
+                        "magnitude report before setting this.")
+    g.add_argument("--gen_lap_beta", type=float, default=0.0)
+    g.add_argument("--gen_lap_gamma", type=float, default=0.0)
+    return p
+
+
+def build_generator_config(a):
+    from patchreach.patch.conditional_generator import GeneratorConfig
+    return GeneratorConfig(
+        size=a.patch_size, base_ch=a.gen_base_ch, depth=a.gen_depth,
+        cond=a.gen_cond, residual=a.gen_residual,
+        residual_scale=a.gen_residual_scale,
+        noise_dim=a.gen_noise_dim,
+        csf_threshold=a.csf_threshold, csf_model=a.csf_model,
+        csf_beta=a.csf_beta, csf_min_cycles=a.csf_min_cycles,
+        csf_pixel_size_cm=a.csf_pixel_size_cm,
+        csf_viewing_distance_cm=a.csf_viewing_distance_cm).validate()
+
+
+def setup_model(a):
+    """(model, n_channels, n_active, spec)."""
+    if not getattr(a, "cityscapes_root", None):
+        raise SystemExit("--cityscapes_root is required (or set it in --config)")
+    cfg, weights, spec = resolve(a.arch, a.cfg_path, a.weights)
+    print(f"\n[arch] {a.arch} — {spec.family}")
+    print(f"[cfg ] {cfg}")
+    print(f"[ckpt] {weights}")
+    device = get_device()
+    amp_dtype = low_precision_dtype() if getattr(a, "low_pr", False) else None
+    model = WrappedSegModel(load_segmentor(cfg, weights)[0],
+                            amp_dtype=amp_dtype).to(device)
+    print({None: "[prec] fp32",
+           torch.bfloat16: "[prec] bf16 (autocast)",
+           torch.float16: "[prec] fp16 (autocast, grad-scaled)"}[amp_dtype])
+
+    tc = getattr(model.model, "test_cfg", None) or {}
+    want = getattr(a, "inference", "whole")
+    if want == "slide" or (want == "auto" and tc.get("mode") == "slide"):
+        if not (tc.get("crop_size") and tc.get("stride")):
+            raise SystemExit(
+                f"--inference {want} needs crop_size and stride in the config's "
+                f"test_cfg, but {a.arch} declares mode={tc.get('mode')!r}. "
+                f"Nothing to slide with — use --inference whole.")
+        crop, stride = tuple(tc["crop_size"]), tuple(tc["stride"])
+        model = SlidingWindowSegModel(
+            model, crop, stride, a.num_classes,
+            checkpoint=getattr(a, "slide_checkpoint", False)).to(device)
+        print(f"[infer] slide crop={crop} stride={stride}"
+              f"{' (checkpointed)' if model.checkpoint else ''}")
+    else:
+        print("[infer] whole")
+
+    n_ch, n_act = channel_probe(model, device, min(a.img_h, 512),
+                                min(a.img_w, 1024))
+    print(f"[head] {n_ch} channels ({n_act} numerically active)")
+    return model, n_ch, n_act, spec
+
+
+def make_dataset(a, split, random_crop=None):
+    """CityscapesSeg honouring --img_h/--img_w and --scale."""
+    if random_crop is None:
+        random_crop = (split == "train")
+    return CityscapesSeg(a.cityscapes_root, split, a.img_h, a.img_w,
+                         scale=getattr(a, "scale", "resize"),
+                         random_crop=random_crop)
+
+
+def image_indices(arg, n_val):
+    """'fixed10' | 'all' | comma/space separated indices."""
+    if arg in (None, "fixed10"):
+        return FIXED10
+    if arg == "all":
+        return list(range(n_val))
+    return [int(x) for x in str(arg).replace(",", " ").split()]
+
+
+def build_patch(a, device, mean_t, std_t, generator=None,
+                init_reference=None):
+    from patchreach.patch.spec import PatchConfig, Patch
+    cfg = PatchConfig(
+        mode=a.patch_mode, size=a.patch_size, scale=a.patch_scale,
+        scale_ref=getattr(a, "patch_scale_ref", "height"),
+        shape=a.shape, placement=a.placement,
+        placement_class=a.placement_class, reference=a.reference,
+        placement_xy=tuple(a.placement_xy),
+        placement_margin=getattr(a, "placement_margin", 0),
+        pixel_param=getattr(a, "pixel_param", "sigmoid"),
+        raw_init=getattr(a, "raw_init", "grey"),
+        reference_fit=a.reference_fit, logit_clip=a.logit_clip, shape_bg=a.shape_bg, shape_thresh=a.shape_thresh,
+        lap_alpha=a.lap_alpha, lap_beta=a.lap_beta, lap_gamma=a.lap_gamma,
+        lap_edge_thresh=a.lap_edge_thresh,
+        lap_freeze_edges=a.lap_freeze_edges, init_from=a.init_from,
+        csf_enforce=getattr(a, "csf_enforce", "nominal"),
+        csf_param=getattr(a, "csf_param", "pgd"),
+        csf_threshold=a.csf_threshold, csf_model=a.csf_model,
+        csf_beta=a.csf_beta, csf_min_cycles=a.csf_min_cycles,
+        csf_pixel_size_cm=a.csf_pixel_size_cm,
+        csf_viewing_distance_cm=a.csf_viewing_distance_cm,
+        csf_display_peak_cd_m2=getattr(a, "csf_display_peak_cd_m2", 100.0),
+        csf_lref=getattr(a, "csf_lref", 0.0),
+        csf_max_cpp=getattr(a, "csf_max_cpp", 0.0),
+        csf_composite=getattr(a, "csf_composite", "clip"),
+        tsallis_q=getattr(a, "tsallis_q", 0.0),
+        tsallis_schedule=getattr(a, "tsallis_schedule", "const"),
+        tsallis_q_start=getattr(a, "tsallis_q_start", -2.0),
+        tsallis_q_end=getattr(a, "tsallis_q_end", 1.0))
+    return Patch(cfg, device, mean_t, std_t, generator=generator,
+                 init_reference=init_reference)

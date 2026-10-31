@@ -1,0 +1,8 @@
+results/
+__pycache__/
+*.pt
+*.pth
+*.egg-info/
+.ipynb_checkpoints/
+slurm/
+slurm-*.out

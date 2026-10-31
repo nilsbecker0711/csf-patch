@@ -1,0 +1,13 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "patchreach"
+version = "1.0.0"
+description = "CSF-bounded adversarial patches for semantic segmentation"
+requires-python = ">=3.9"
+dependencies = ["numpy", "pillow", "pyyaml", "pandas", "matplotlib", "tqdm"]
+
+[tool.setuptools.packages.find]
+include = ["patchreach*"]
