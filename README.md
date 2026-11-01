@@ -42,10 +42,10 @@ export PATCHREACH_CHECKPOINTS=/path/to/checkpoints
 checkpoint under `PATCHREACH_CHECKPOINTS`. Available names:
 
 ```
-segformer_b0  segformer_b5  setr_pup  internimage_t/l/xl  swin_t  convnext_t
-deeplabv3plus_r18/r50/r101  unet_s5d16  pidnet_s/m/l
+segformer_b0  segformer_b5  setr_pup  deeplabv3plus_r18/r50/r101 (internimage_t/l/xl  swin_t  convnext_t
+  unet_s5d16  pidnet_s/m/l) 
 ```
-
+The experiments only tested for SegFormer, DeepLab and SETR, so the other models work just in theory and might require tuning by the User!
 `--cfg_path` and `--weights` override the registry per call. The config must
 match the checkpoint variant — a B0 config will not build B5.
 
